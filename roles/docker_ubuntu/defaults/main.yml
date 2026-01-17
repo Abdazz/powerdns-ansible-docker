@@ -1,0 +1,7 @@
+---
+#L'ensemble de variables réquis dans le main.yml du dossier tasks  
+create_containers: 0
+default_container_name: docker
+default_container_image: ubuntu
+default_container_command: sleep 1d
+node_user: abdoul

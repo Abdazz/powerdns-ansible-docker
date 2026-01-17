@@ -1,0 +1,304 @@
+---
+  #0 Désactivation du stub listener systemd-resolved pour libérer le port 53
+  - name: Disable systemd-resolved stub listener
+    block:
+      - name: Create resolved.conf.d directory
+        file:
+          path: /etc/systemd/resolved.conf.d
+          state: directory
+          mode: '0755'
+
+      - name: Disable DNSStubListener
+        copy:
+          dest: /etc/systemd/resolved.conf.d/nostub.conf
+          content: |
+            [Resolve]
+            DNSStubListener=no
+          mode: '0644'
+        register: resolved_config
+
+      - name: Restart systemd-resolved
+        systemd:
+          name: systemd-resolved
+          state: restarted
+        when: resolved_config.changed
+    tags:
+      - pdns
+      - dns-setup
+
+  #1 Création d'un réseau docker. ce réseau permettra d'interconnecter tous nos conteneurs. Le nom de ce réseau est "pdns-net-mysql" son adresse est "172.5.0.0".
+  - name: Create docker network
+    community.docker.docker_network:
+      name: pdns-net-mysql
+      state: present
+      ipam_config:
+        - subnet: '172.5.0.0/16'
+          gateway: '172.5.0.1'
+    tags:
+      - pdns
+      - pdns-admin
+      - pdns-recursor
+
+  #2 Copie du répertoire pdns-recursor vers l'hôte distant pour la construction de l'image
+  - name: Copy pdns-recursor directory
+    copy:
+      src: docker/pdns-recursor/
+      dest: /tmp/pdns-recursor/
+      force: yes
+    tags:
+      - pdns-recursor
+
+  #3 Construction de l'image Docker pour le récurseur PowerDNS
+  - name: Build pdns recursor
+    community.docker.docker_image:
+      name: pschiffe/pdns-recursor
+      state: '{{ i_state }}'
+      source: build
+      force_source: true
+      build:
+        pull: true
+        path: /tmp/pdns-recursor
+    tags:
+      - pdns-recursor
+
+  #4 Construction de l'image Docker pour le récurseur PowerDNS (version Alpine)
+  - name: Build pdns recursor alpine version
+    community.docker.docker_image:
+      name: pschiffe/pdns-recursor
+      tag: alpine
+      state: '{{ i_state }}'
+      source: build
+      force_source: true
+      build:
+        pull: true
+        path: /tmp/pdns-recursor
+        dockerfile: Dockerfile.alpine
+    tags:
+      - pdns-recursor
+
+  #5 Déploiement du conteneur récurseur PowerDNS
+  - name: PDNS recursor
+    community.docker.docker_container:
+      name: pdns-recursor-mysql
+      image: pschiffe/pdns-recursor:{{ "alpine" if alpine | bool else "latest" }}
+      state: '{{ c_state }}'
+      networks:
+        - name: pdns-net-mysql
+      published_ports:
+        - '5354:53/udp'
+        - '5354:53/tcp'
+      volumes:
+        - /etc/localtime:/etc/localtime:ro
+      ulimits:
+        - 'nofile:10000:10000'
+      env:
+        PDNS_forward_zones: '{{ dns_local_suffix }}={{ pdns_master_ip }}'
+    tags:
+      - pdns-recursor
+
+  #6 Déploiement du conteneur de base de données MariaDB
+  - name: DB
+    community.docker.docker_container:
+      name: pdns-mariadb
+      image: mariadb:lts-ubi
+      pull: true
+      state: '{{ c_state }}'
+      networks:
+        - name: pdns-net-mysql
+          aliases:
+            - db
+            - mysql
+      volumes:
+        - /etc/localtime:/etc/localtime:ro
+        - pdns-mariadb-volume:/var/lib/mysql:Z
+      env:
+        MYSQL_ROOT_PASSWORD: 'my-secret-pw'
+      healthcheck:
+        test: ['CMD', 'healthcheck.sh', '--connect', '--innodb_initialized']
+        timeout: 10s
+        retries: 5
+    tags:
+      - db
+
+  #7 Déploiement du conteneur phpMyAdmin pour la gestion de la base de données
+  - name: Phpmyadmin
+    community.docker.docker_container:
+      name: pdns-phpmyadmin
+      image: phpmyadmin:5
+      pull: true
+      state: '{{ c_state }}'
+      networks:
+        - name: pdns-net-mysql
+      published_ports:
+        - '8888:80'
+      volumes:
+        - /etc/localtime:/etc/localtime:ro
+      healthcheck:
+        test: ['CMD', 'curl', '-fsSL', 'http://127.0.0.1:80']
+        timeout: 10s
+        retries: 5
+    tags:
+      - db
+
+  #8 Copie du répertoire pdns-mysql vers l'hôte distant pour la construction de l'image
+  - name: Copy pdns-mysql directory
+    copy:
+      src: docker/pdns-mysql/
+      dest: /tmp/pdns-mysql/
+      force: yes
+    tags:
+      - pdns
+
+  #9 Construction de l'image Docker PowerDNS avec backend MySQL
+  - name: Build pdns mysql
+    community.docker.docker_image:
+      name: pschiffe/pdns-mysql
+      state: '{{ i_state }}'
+      source: build
+      force_source: true
+      build:
+        pull: true
+        path: /tmp/pdns-mysql
+    tags:
+      - pdns
+
+  #10 Construction de l'image Docker PowerDNS avec backend MySQL (version Alpine)
+  - name: Build pdns mysql alpine version
+    community.docker.docker_image:
+      name: pschiffe/pdns-mysql
+      tag: alpine
+      state: '{{ i_state }}'
+      source: build
+      force_source: true
+      build:
+        pull: true
+        path: /tmp/pdns-mysql
+        dockerfile: Dockerfile.alpine
+    tags:
+      - pdns
+
+  #11 Déploiement du conteneur PowerDNS master (serveur DNS principal)
+  - name: PDNS mysql master
+    community.docker.docker_container:
+      name: pdns-mysql
+      image: pschiffe/pdns-mysql:{{ "alpine" if alpine | bool else "latest" }}
+      state: '{{ c_state }}'
+      hostname: ns1.example.com
+      networks:
+        - name: pdns-net-mysql
+          ipv4_address: '{{ pdns_master_ip }}'
+          aliases:
+            - pdns
+      published_ports:
+        - '53:53/udp'
+        - '53:53/tcp'
+      etc_hosts:
+        ns1.example.com: '{{ pdns_master_ip }}'
+        ns2.example.com: '{{ pdns_slave_ip }}'
+      volumes:
+        - /etc/localtime:/etc/localtime:ro
+      env:
+        PDNS_gmysql_password: 'my-secret-pw'
+        PDNS_primary: 'yes'
+        PDNS_api: 'yes'
+        PDNS_api_key: 'secret'
+        PDNS_webserver: 'yes'
+        PDNS_webserver_address: '0.0.0.0'
+        PDNS_webserver_allow_from: '172.5.0.0/16'
+        PDNS_version_string: 'anonymous'
+        PDNS_default_ttl: '1500'
+        PDNS_allow_axfr_ips: '{{ pdns_slave_ip }}'
+        PDNS_only_notify: '{{ pdns_slave_ip }}'
+    tags:
+      - pdns
+
+  #12 Déploiement du conteneur PowerDNS slave (serveur DNS secondaire)
+  - name: PDNS mysql slave
+    community.docker.docker_container:
+      name: pdns-mysql-slave
+      image: pschiffe/pdns-mysql:{{ "alpine" if alpine | bool else "latest" }}
+      state: '{{ c_state }}'
+      hostname: ns2.example.com
+      networks:
+        - name: pdns-net-mysql
+          ipv4_address: '{{ pdns_slave_ip }}'
+      published_ports:
+        - '5454:53/udp'
+        - '5454:53/tcp'
+      etc_hosts:
+        ns1.example.com: '{{ pdns_master_ip }}'
+        ns2.example.com: '{{ pdns_slave_ip }}'
+      volumes:
+        - /etc/localtime:/etc/localtime:ro
+      env:
+        PDNS_gmysql_dbname: 'powerdnsslave'
+        PDNS_gmysql_password: 'my-secret-pw'
+        PDNS_secondary: 'yes'
+        PDNS_autosecondary: 'yes'
+        PDNS_webserver: 'yes'
+        PDNS_webserver_address: '0.0.0.0'
+        PDNS_webserver_allow_from: '172.5.0.0/16'
+        PDNS_version_string: 'anonymous'
+        PDNS_disable_axfr: 'yes'
+        PDNS_allow_notify_from: '{{ pdns_master_ip }}'
+        SUPERMASTER_IPS: '{{ pdns_master_ip }}'
+    tags:
+      - pdns
+
+  #13 Copie du répertoire pdns-admin vers l'hôte distant pour la construction de l'image
+  - name: Copy pdns-admin directory
+    copy:
+      src: docker/pdns-admin/
+      dest: /tmp/pdns-admin/
+      force: yes
+    tags:
+      - pdns-admin
+
+  #14 Construction de l'image Docker pour l'interface d'administration PowerDNS-Admin
+  - name: Build pdns-admin
+    community.docker.docker_image:
+      name: pschiffe/pdns-admin
+      tag: latest
+      state: '{{ i_state }}'
+      source: build
+      force_source: true
+      build:
+        pull: true
+        path: /tmp/pdns-admin
+    tags:
+      - pdns-admin
+
+  #15 Déploiement du conteneur PowerDNS-Admin (interface web d'administration)
+  - name: PDNS-admin
+    community.docker.docker_container:
+      name: pdns-admin-mysql
+      image: pschiffe/pdns-admin
+      state: '{{ c_state }}'
+      networks:
+        - name: pdns-net-mysql
+          aliases:
+            - pdns-admin
+      published_ports:
+        - '8889:8080'
+      volumes:
+        - /etc/localtime:/etc/localtime:ro
+      env:
+        PDNS_ADMIN_SQLA_DB_PASSWORD: 'my-secret-pw'
+        PDNS_VERSION: '5.0'
+        PDNS_API_KEY: 'secret'
+    tags:
+      - pdns-admin
+
+  #16 Suppression du volume Docker MariaDB (uniquement si wipe=true)
+  - name: Remove docker volume
+    community.docker.docker_volume:
+      name: pdns-mariadb-volume
+      state: absent
+    when: wipe | bool
+
+  #17 Suppression du réseau Docker (uniquement si wipe=true)
+  - name: Remove network
+    community.docker.docker_network:
+      name: pdns-net-mysql
+      state: absent
+    when: wipe | bool

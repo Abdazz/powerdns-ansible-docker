@@ -1,0 +1,8 @@
+---
+- name: Automatisation de PowerDNS avec Ansible et Docker
+  hosts: pdns_servers
+  become: true
+  become_user: root
+  roles:
+    # - docker_ubuntu
+    - powerdns

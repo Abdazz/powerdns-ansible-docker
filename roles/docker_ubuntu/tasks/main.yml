@@ -1,0 +1,60 @@
+---
+#1 Mise à jour des dépôts APT et mise à niveau complète du système
+- name: Update repositories & upgrade
+  ansible.builtin.apt:
+    update_cache: yes
+    force_apt_get: yes
+    cache_valid_time: 3600
+    upgrade: dist
+    autoclean: yes
+
+#2 Installation de l'outil "aptitude" pour une meilleure gestion des paquets
+- name: Installation de "aptitude"
+  ansible.builtin.apt: 
+    name: aptitude
+    state: latest 
+    update_cache: yes 
+    force_apt_get: yes
+    cache_valid_time: 3600
+    autoclean: yes
+
+#3 Installation des paquets préréquis pour Docker (HTTPS, certificats, Python Docker SDK)
+- name: Installation des paquets préréquis
+  apt: name={{ item }} state=latest update_cache=yes
+  loop: [ 'apt-transport-https', 'ca-certificates', 'curl', 'software-properties-common', 'python3-pip', 'virtualenv', 'python3-setuptools', 'python3-docker']
+
+#4 Ajout de la clé GPG officielle du dépôt Docker pour garantir l'authenticité des paquets
+- name: Ajout de la clé GPG
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+
+#5 Ajout du dépôt stable officiel de Docker dans les sources APT
+- name: Ajout du dépot de Docker
+  apt_repository:
+    repo: deb https://download.docker.com/linux/ubuntu bionic stable
+    state: present
+
+#6 Installation de Docker CE (Community Edition) avec mise à jour du cache APT
+- name: Mise à jour du cache APT et installation de Docker
+  apt: update_cache=yes name=docker-ce state=latest
+
+#7 Démarrage du service Docker et activation au démarrage du système
+- name: Start Docker service
+  service:
+    name: docker
+    state: started
+    enabled: yes
+
+#8 Configuration des permissions du socket Docker pour permettre l'accès utilisateur
+- name: Allow user to access docker socket
+  file:
+    path: /var/run/docker.sock
+    mode: '666'
+
+#9 Ajout de l'utilisateur au groupe "docker" pour utiliser Docker sans sudo
+- name: Ajouter l'utilisateur au groupe docker
+  user:
+    name: "{{ node_user }}"
+    groups: docker
+    append: yes
